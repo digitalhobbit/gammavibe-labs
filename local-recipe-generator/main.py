@@ -1,16 +1,24 @@
 import asyncio
+from datetime import datetime
+from typing import Literal
+from diffusers import FluxPipeline
 import logging
+from pathlib import Path
 import time
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
-from pydantic_ai.output import ToolOutput
+from pydantic_ai.output import NativeOutput
+
+import torch
 
 MODEL_NAME = "gemma4:e4b"
 OLLAMA_HOST = "http://localhost:11434"
 OLLAMA_URL = f"{OLLAMA_HOST}/v1"
+IMAGE_MODEL_NAME = "black-forest-labs/FLUX.1-schnell"
+TEMPERATURE = 0.2
 
 logging.basicConfig(
     level=logging.INFO,
@@ -73,6 +81,27 @@ class Recipe(BaseModel):
     )
 
 
+class ImagePrompt(BaseModel):
+    subject: Literal["final_dish", "preparation_stage"] = Field(
+        description=(
+            "What the image should depict. Choose 'final_dish' for a plated "
+            "shot of the finished recipe, or 'preparation_stage' for a "
+            "compelling interim moment (e.g. ingredients laid out, dough "
+            "being kneaded, sauce reducing). Pick whichever is more visually "
+            "interesting for THIS recipe."
+        )
+    )
+    prompt: str = Field(
+        max_length=300,
+        description=(
+            "A concise FLUX-style image prompt, 40-55 words, under 300 "
+            "characters. Describe subject, composition, lighting, and mood. "
+            "FLUX's CLIP encoder only reads the first 77 tokens (~50 words), "
+            "so every word counts. Do NOT include negative prompts."
+        ),
+    )
+
+
 def build_model() -> OpenAIChatModel:
     # Ollama exposes an OpenAI-compatible API at /v1
     provider = OpenAIProvider(base_url=OLLAMA_URL, api_key="ollama")
@@ -82,8 +111,9 @@ def build_model() -> OpenAIChatModel:
 async def suggest_dishes(model: OpenAIChatModel, mood: str) -> DishList:
     agent = Agent(
         model,
-        output_type=ToolOutput(DishList),
+        output_type=NativeOutput(DishList),
         output_retries=3,
+        model_settings=OpenAIChatModelSettings(temperature=TEMPERATURE),
         system_prompt=(
             "You are a creative chef. Given the user's mood or craving, "
             "suggest dishes that fit. Favor variety across cuisines, "
@@ -101,8 +131,9 @@ async def suggest_dishes(model: OpenAIChatModel, mood: str) -> DishList:
 async def get_recipe(model: OpenAIChatModel, dish_name: str) -> Recipe:
     agent = Agent(
         model,
-        output_type=ToolOutput(Recipe),
+        output_type=NativeOutput(Recipe),
         output_retries=3,
+        model_settings=OpenAIChatModelSettings(temperature=TEMPERATURE),
         system_prompt=(
             "You are a chef. Given a dish name, produce a complete recipe "
             "that a home cook could realistically follow — sensible "
@@ -114,6 +145,31 @@ async def get_recipe(model: OpenAIChatModel, dish_name: str) -> Recipe:
     t0 = time.perf_counter()
     result = await agent.run(f"Give me a recipe for: {dish_name}")
     log.info("get_recipe: received recipe in %.1fs", time.perf_counter() - t0)
+    return result.output
+
+
+async def generate_image_prompt(model: OpenAIChatModel, recipe: Recipe) -> ImagePrompt:
+    agent = Agent(
+        model,
+        output_type=NativeOutput(ImagePrompt),
+        output_retries=3,
+        model_settings=OpenAIChatModelSettings(temperature=TEMPERATURE),
+        system_prompt=(
+            "You are a food photography art director. Given a recipe, produce "
+            "a single concise image prompt for FLUX.1.\n\n"
+            "Decide whether a plated final dish or an interim preparation "
+            "moment would be most visually compelling, then write a prompt of "
+            "40-55 words (under 300 characters). Cover subject, camera angle, "
+            "lighting, and mood in compact evocative phrases — FLUX's CLIP "
+            "encoder only sees the first 77 tokens (~50 words), so brevity "
+            "matters. Favor natural light and shallow depth of field. Do NOT "
+            "describe what you DON'T want."
+        ),
+    )
+    log.info("generate_image_prompt: asking Gemma for image prompt")
+    t0 = time.perf_counter()
+    result = await agent.run(f"Recipe:\n{recipe.model_dump_json(indent=2)}")
+    log.info("generate_image_prompt: got prompt in %.1fs", time.perf_counter() - t0)
     return result.output
 
 
@@ -142,6 +198,46 @@ def print_recipe(recipe: Recipe) -> None:
     print()
 
 
+def _load_pipeline() -> FluxPipeline:
+    log.info("Loading image model...")
+    t0 = time.perf_counter()
+    pipe = FluxPipeline.from_pretrained(IMAGE_MODEL_NAME, torch_dtype=torch.bfloat16)
+    pipe.enable_sequential_cpu_offload(device="cuda:0")
+    # VAE tiling keeps the final decode from spiking VRAM at high resolutions.
+    pipe.vae.enable_tiling()
+    log.info("FLUX loaded with sequential CPU offload in %.1fs", time.perf_counter() - t0)
+
+    return pipe
+
+
+def generate_image(
+    prompt: str,
+    output_path: Path,
+    width: int = 1344,
+    height: int = 768,
+    seed: int | None = None,
+) -> Path:
+    pipe = _load_pipeline()
+    generator = (
+        torch.Generator("cpu").manual_seed(seed) if seed is not None else None
+    )
+    preview = prompt if len(prompt) <= 80 else prompt[:80] + "..."
+    log.info("generate_image: %dx%d, prompt=%r", width, height, preview)
+    t0 = time.perf_counter()
+    image = pipe(
+        prompt,
+        width=width,
+        height=height,
+        num_inference_steps=4,
+        guidance_scale=0.0,
+        generator=generator,
+    ).images[0]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output_path)
+    log.info("generate_image: saved %s in %.1fs", output_path, time.perf_counter() - t0)
+    return output_path
+
+
 async def main():
     model = build_model()
     mood = input("What are you in the mood for? ").strip()
@@ -153,6 +249,17 @@ async def main():
     print(f"\nGetting the full recipe for '{chosen.name}'...")
     recipe = await get_recipe(model, chosen.name)
     print_recipe(recipe)
+
+
+    print("Asking Gemma for an image prompt...")
+    img_prompt = await generate_image_prompt(model, recipe)
+    print(f"\nImage subject: {img_prompt.subject}")
+    print(f"Image prompt: {img_prompt.prompt}\n")
+
+    out_path = Path("output") / f"recipe_{datetime.now():%Y%m%d_%H%M%S}.png"
+    print("Generating image with FLUX.1-schnell (first run downloads ~24GB)...")
+    generate_image(img_prompt.prompt, out_path)
+    print(f"\n✔ Image saved to {out_path.resolve()}")
 
 
 if __name__ == "__main__":
