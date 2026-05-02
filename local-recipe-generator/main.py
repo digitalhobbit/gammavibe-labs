@@ -77,7 +77,7 @@ class Recipe(BaseModel):
     )
     preparation_steps: list[str] = Field(
         max_length=20,
-        description="Ordered preparation steps. Each list item is one step as a full sentence (max 400 chars).",
+        description="Ordered preparation steps. Each list item is one step as a full sentence (max 400 chars). DO NOT add numbering or 'Step 1' etc. — just the instruction text.",
     )
 
 
@@ -139,6 +139,7 @@ async def get_recipe(model: OpenAIChatModel, dish_name: str) -> Recipe:
             "that a home cook could realistically follow — sensible "
             "quantities, common ingredients where possible, and steps in "
             "the order a cook would actually do them."
+            "DO NOT add numbering or 'Step 1' etc. to the preparation steps — just the instruction text in each list item."
         ),
     )
     log.info("get_recipe: sending request for dish=%r", dish_name)
@@ -182,6 +183,24 @@ def pick_dish(dishes: list[Dish]) -> Dish:
         if raw.isdigit() and 1 <= int(raw) <= len(dishes):
             return dishes[int(raw) - 1]
         print("Invalid choice, try again.")
+
+
+def recipe_to_markdown(recipe: Recipe, image_filename: str) -> str:
+    lines = [
+        f"![{recipe.dish_name}]({image_filename})",
+        "",
+        f"# {recipe.dish_name}",
+        "",
+        recipe.description,
+        "",
+        "## Ingredients",
+        "",
+    ]
+    lines.extend(f"- {ing.quantity} {ing.name}" for ing in recipe.ingredients)
+    lines.extend(["", "## Instructions", ""])
+    lines.extend(f"{i}. {step}" for i, step in enumerate(recipe.preparation_steps, 1))
+    lines.append("")
+    return "\n".join(lines)
 
 
 def print_recipe(recipe: Recipe) -> None:
@@ -256,10 +275,18 @@ async def main():
     print(f"\nImage subject: {img_prompt.subject}")
     print(f"Image prompt: {img_prompt.prompt}\n")
 
-    out_path = Path("output") / f"recipe_{datetime.now():%Y%m%d_%H%M%S}.png"
+    stem = f"recipe_{datetime.now():%Y%m%d_%H%M%S}"
+    image_path = Path("output") / f"{stem}.png"
+    markdown_path = Path("output") / f"{stem}.md"
+
     print("Generating image with FLUX.1-schnell (first run downloads ~24GB)...")
-    generate_image(img_prompt.prompt, out_path)
-    print(f"\n✔ Image saved to {out_path.resolve()}")
+    generate_image(img_prompt.prompt, image_path)
+    print(f"\n✔ Image saved to {image_path.resolve()}")
+
+    markdown_path.write_text(
+        recipe_to_markdown(recipe, image_path.name), encoding="utf-8"
+    )
+    print(f"✔ Recipe saved to {markdown_path.resolve()}")
 
 
 if __name__ == "__main__":
