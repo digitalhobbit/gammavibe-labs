@@ -14,11 +14,32 @@ from pydantic_ai.output import NativeOutput
 
 import torch
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# gemma4:e4b — small and fast, and reliable enough at structured output that
+# pydantic-ai can validate the schemas below without constant retries. Bigger
+# models give better prose but stop being practical for a fully-local app.
 MODEL_NAME = "gemma4:e4b"
 OLLAMA_HOST = "http://localhost:11434"
 OLLAMA_URL = f"{OLLAMA_HOST}/v1"
+
+# FLUX.1-schnell — 4-step distilled variant of FLUX.1. Produces a usable image
+# in seconds rather than the 30+ steps the full dev model wants, and the
+# weights still fit on a single consumer GPU once we offload (see below).
 IMAGE_MODEL_NAME = "black-forest-labs/FLUX.1-schnell"
+
+# Low temperature keeps Gemma on-schema. At the provider default (~0.7) it
+# occasionally invents fields or drifts off structure, which triggers
+# pydantic-ai retries; 0.2 is low enough to stay in spec but still gives some
+# variety across dish suggestions.
 TEMPERATURE = 0.2
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,7 +53,14 @@ logging.getLogger("httpx").setLevel(logging.INFO)
 logging.getLogger("pydantic_ai").setLevel(logging.DEBUG)
 
 
+# ---------------------------------------------------------------------------
+# Output schemas (what we ask Gemma to return; pydantic-ai validates these)
+# ---------------------------------------------------------------------------
+
+
 class Dish(BaseModel):
+    """A single dish suggestion: short name plus a one-line description."""
+
     name: str = Field(
         max_length=80,
         description="Short dish name, e.g. 'Crispy Corn Fritters'. Max 80 characters.",
@@ -44,6 +72,8 @@ class Dish(BaseModel):
 
 
 class DishList(BaseModel):
+    """A handful of dish suggestions for the user to pick from."""
+
     dishes: list[Dish] = Field(
         min_length=3,
         max_length=5,
@@ -52,6 +82,8 @@ class DishList(BaseModel):
 
 
 class Ingredient(BaseModel):
+    """One ingredient line: name and a free-text quantity (e.g. '2 cups')."""
+
     name: str = Field(
         max_length=80,
         description="Ingredient name, e.g. 'all-purpose flour'.",
@@ -63,6 +95,8 @@ class Ingredient(BaseModel):
 
 
 class Recipe(BaseModel):
+    """A complete recipe: description, ingredient list, and ordered steps."""
+
     dish_name: str = Field(
         max_length=80,
         description="The name of the dish this recipe produces.",
@@ -82,6 +116,8 @@ class Recipe(BaseModel):
 
 
 class ImagePrompt(BaseModel):
+    """A FLUX-ready image prompt plus a hint at what the image should depict."""
+
     subject: Literal["final_dish", "preparation_stage"] = Field(
         description=(
             "What the image should depict. Choose 'final_dish' for a plated "
@@ -102,8 +138,15 @@ class ImagePrompt(BaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# LLM agents (Gemma via Ollama's OpenAI-compatible API)
+# ---------------------------------------------------------------------------
+
+
 def build_model() -> OpenAIChatModel:
-    # Ollama exposes an OpenAI-compatible API at /v1
+    # Ollama exposes an OpenAI-compatible API at /v1, so we drive it through
+    # pydantic-ai's OpenAI provider with a placeholder api_key — Ollama
+    # ignores it but the SDK requires the field.
     provider = OpenAIProvider(base_url=OLLAMA_URL, api_key="ollama")
     return OpenAIChatModel(MODEL_NAME, provider=provider)
 
@@ -174,6 +217,11 @@ async def generate_image_prompt(model: OpenAIChatModel, recipe: Recipe) -> Image
     return result.output
 
 
+# ---------------------------------------------------------------------------
+# CLI and Markdown helpers
+# ---------------------------------------------------------------------------
+
+
 def pick_dish(dishes: list[Dish]) -> Dish:
     print("\nSuggested dishes:")
     for i, d in enumerate(dishes, 1):
@@ -217,12 +265,30 @@ def print_recipe(recipe: Recipe) -> None:
     print()
 
 
+# ---------------------------------------------------------------------------
+# Image generation (FLUX.1-schnell via diffusers)
+# ---------------------------------------------------------------------------
+
+
 def _load_pipeline() -> FluxPipeline:
     log.info("Loading image model...")
     t0 = time.perf_counter()
     pipe = FluxPipeline.from_pretrained(IMAGE_MODEL_NAME, torch_dtype=torch.bfloat16)
+    # Sequential CPU offload swaps FLUX's submodules (text encoders, transformer,
+    # VAE) on and off the GPU as they're needed, keeping peak VRAM low. We do
+    # this because Ollama still has Gemma resident in GPU memory, and loading
+    # FLUX fully alongside it would OOM most consumer cards.
+    #
+    # Faster alternative if you don't need Gemma any more: shell out to
+    # `ollama stop gemma4:e4b` first, drop this offload call, and let FLUX
+    # run entirely on the GPU. We don't bother here because the demo is short.
+    #
+    # device="cuda:0" is required, not optional: with offload enabled
+    # diffusers needs to know which device to swap modules onto, and it
+    # won't infer a default when multiple GPUs are present.
     pipe.enable_sequential_cpu_offload(device="cuda:0")
-    # VAE tiling keeps the final decode from spiking VRAM at high resolutions.
+    # VAE tiling decodes the final latent in chunks instead of one big tensor,
+    # which keeps the last step from spiking VRAM at high resolutions.
     pipe.vae.enable_tiling()
     log.info("FLUX loaded with sequential CPU offload in %.1fs", time.perf_counter() - t0)
 
@@ -243,6 +309,8 @@ def generate_image(
     preview = prompt if len(prompt) <= 80 else prompt[:80] + "..."
     log.info("generate_image: %dx%d, prompt=%r", width, height, preview)
     t0 = time.perf_counter()
+    # FLUX.1-schnell is distilled to 4 steps with no classifier-free guidance —
+    # these two values are part of the model contract, not knobs to tune.
     image = pipe(
         prompt,
         width=width,
@@ -255,6 +323,11 @@ def generate_image(
     image.save(output_path)
     log.info("generate_image: saved %s in %.1fs", output_path, time.perf_counter() - t0)
     return output_path
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 async def main():
