@@ -1,8 +1,8 @@
 # Local Recipe Generator
 
-A small command-line app that turns a mood ("something warm and spicy", "light summer dinner") into a complete recipe with a generated food photo — running fully on your own machine. It uses a local Gemma model via Ollama for the text (dish suggestions, recipes, image prompts) and FLUX.1-schnell via `diffusers` for the image. Output is saved as a Markdown file with the embedded image alongside the PNG.
+A small command-line app that turns a mood ("something warm and spicy", "light summer dinner") into a complete recipe with a generated food photo — running fully on your own machine. It uses a local Gemma model via Ollama for the text (dish suggestions, recipes, image prompts) and FLUX.1-schnell via `diffusers` for the image. Output is saved as a Markdown file with the embedded ∏image alongside the PNG.
 
-The accompanying YouTube video is **coming soon** on [GammaVibe](https://www.youtube.com/@GammaVibeLab).
+The accompanying YouTube video is [here](https://youtu.be/tXbBnkdemqE).
 
 ## Dependencies
 

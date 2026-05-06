@@ -6,7 +6,7 @@ Hands-on AI projects from [GammaVibe on YouTube](https://www.youtube.com/@GammaV
 
 | Folder                   | What it does                                                         | Video           |
 |--------------------------|----------------------------------------------------------------------|-----------------|
-| `local-recipe-generator` | Generate recipes and food images using Gemma 4 + FLUX.1, fully local | Coming soon     |
+| `local-recipe-generator` | Generate recipes and food images using Gemma 4 + FLUX.1, fully local | https://youtu.be/tXbBnkdemqE |
 
 ## What this is (and isn't)
 
